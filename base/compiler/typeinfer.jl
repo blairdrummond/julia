@@ -21,30 +21,34 @@ function typeinf(interp::AbstractInterpreter, frame::InferenceState)
         finish(caller, interp)
     end
     # collect results for the new expanded frame
-    results = InferenceResult[ frames[i].result for i in 1:length(frames) ]
+    results = Tuple{InferenceResult, Bool}[ ( frames[i].result,
+        frames[i].cached || frames[i].parent !== nothing ) for i in 1:length(frames) ]
     # empty!(frames)
     min_valid = frame.min_valid
     max_valid = frame.max_valid
     cached = frame.cached
     if cached || frame.parent !== nothing
-        for caller in results
+        for (caller, doopt) in results
             opt = caller.src
             if opt isa OptimizationState
-                optimize(opt, OptimizationParams(interp), caller.result)
-                finish(opt.src, interp)
-                # finish updating the result struct
-                validate_code_in_debug_mode(opt.linfo, opt.src, "optimized")
-                if opt.const_api
-                    if caller.result isa Const
-                        caller.src = caller.result
+                run_optimizer = doopt && may_optimize(interp)
+                if run_optimizer
+                    optimize(opt, OptimizationParams(interp), caller.result)
+                    finish(opt.src, interp)
+                    # finish updating the result struct
+                    validate_code_in_debug_mode(opt.linfo, opt.src, "optimized")
+                    if opt.const_api
+                        if caller.result isa Const
+                            caller.src = caller.result
+                        else
+                            @assert isconstType(caller.result)
+                            caller.src = Const(caller.result.parameters[1])
+                        end
+                    elseif opt.src.inferred
+                        caller.src = opt.src::CodeInfo # stash a copy of the code (for inlining)
                     else
-                        @assert isconstType(caller.result)
-                        caller.src = Const(caller.result.parameters[1])
+                        caller.src = nothing
                     end
-                elseif opt.src.inferred
-                    caller.src = opt.src::CodeInfo # stash a copy of the code (for inlining)
-                else
-                    caller.src = nothing
                 end
                 if min_valid < opt.min_valid
                     min_valid = opt.min_valid
@@ -79,9 +83,9 @@ function typeinf(interp::AbstractInterpreter, frame::InferenceState)
     return true
 end
 
-function CodeInstance(result::InferenceResult, min_valid::UInt, max_valid::UInt,
+function CodeInstance(result::InferenceResult, @nospecialize(inferred_result::Any),
+                      min_valid::UInt, max_valid::UInt,
                       may_compress=true, allow_discard_tree=true)
-    inferred_result = result.src
     local const_flags::Int32
     if inferred_result isa Const
         # use constant calling convention
@@ -140,6 +144,13 @@ already_inferred_quick_test(interp::AbstractInterpreter, mi::MethodInstance) =
 
 # inference completed on `me`
 # update the MethodInstance
+function transform_result_for_cache(interp::AbstractInterpreter, @nospecialize(result::Any))
+    if isa(result, OptimizationState)
+        return result.src
+    end
+    return result
+end
+
 function cache_result!(interp::AbstractInterpreter, result::InferenceResult, min_valid::UInt, max_valid::UInt)
     # check if the existing linfo metadata is also sufficient to describe the current inference result
     # to decide if it is worth caching this
@@ -150,7 +161,8 @@ function cache_result!(interp::AbstractInterpreter, result::InferenceResult, min
 
     # TODO: also don't store inferred code if we've previously decided to interpret this function
     if !already_inferred
-        code_cache(interp)[result.linfo] = CodeInstance(result, min_valid, max_valid,
+        inferred_result = transform_result_for_cache(interp, result.src)
+        code_cache(interp)[result.linfo] = CodeInstance(result, inferred_result, min_valid, max_valid,
             may_compress(interp), may_discard_trees(interp))
     end
     unlock_mi_inference(interp, result.linfo)
@@ -168,16 +180,7 @@ function finish(me::InferenceState, interp::AbstractInterpreter)
     else
         # annotate fulltree with type information
         type_annotate!(me)
-        can_optimize = may_optimize(interp)
-        run_optimizer = (me.cached || me.parent !== nothing) && can_optimize
-        if run_optimizer
-            # construct the optimizer for later use, if we're building this IR to cache it
-            # (otherwise, we'll run the optimization passes later, outside of inference)
-            opt = OptimizationState(me, OptimizationParams(interp), interp)
-            me.result.src = opt
-        elseif !can_optimize
-            me.result.src = me.src
-        end
+        me.result.src = OptimizationState(me, OptimizationParams(interp), interp)
     end
     me.result.result = me.bestguess
     nothing
